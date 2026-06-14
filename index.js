@@ -439,27 +439,27 @@ async function callAIWithFailover(systemPrompt, userMessage) {
         }
     }
     
-    // Try Mistral third
-    if (mistral) {
-        try {
-            console.log('🔄 Trying Mistral...');
-            const response = await mistral.chat({
-                model: "mistral-tiny",
-                messages: [
-                    { role: "system", content: systemPrompt },
-                    { role: "user", content: userMessage }
-                ]
-            });
-            const reply = response.choices[0]?.message?.content;
-            if (reply) {
-                console.log('✅ Mistral succeeded');
-                return { reply, provider: 'mistral' };
-            }
-        } catch (err) {
-            console.log(`⚠️ Mistral failed: ${err.message}`);
-            errors.push(`Mistral: ${err.message}`);
+// Try Mistral third
+if (mistral) {
+    try {
+        console.log('🔄 Trying Mistral...');
+        const response = await mistral.chat.complete({
+            model: "mistral-tiny",
+            messages: [
+                { role: "system", content: systemPrompt },
+                { role: "user", content: userMessage }
+            ]
+        });
+        const reply = response.choices[0]?.message?.content;
+        if (reply) {
+            console.log('✅ Mistral succeeded');
+            return { reply, provider: 'mistral' };
         }
+    } catch (err) {
+        console.log(`⚠️ Mistral failed: ${err.message}`);
+        errors.push(`Mistral: ${err.message}`);
     }
+}
     
     return { reply: null, errors };
 }
