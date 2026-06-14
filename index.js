@@ -3,6 +3,7 @@ const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { Pool } = require('pg');
+const { GoogleGenerativeAI } = require("@google/generative-ai");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -19,6 +20,15 @@ const pool = new Pool({
 
 // JWT Secret
 const JWT_SECRET = process.env.JWT_SECRET || 'moneymind_super_secret_key_change_me';
+
+// Gemini AI initialization (will be null if no API key)
+let genAI = null;
+if (process.env.GEMINI_API_KEY) {
+    genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+    console.log('✅ Gemini AI initialized');
+} else {
+    console.log('⚠️ GEMINI_API_KEY not set. AI features will use fallback responses.');
+}
 
 // ==================== TEST ROOT ROUTE ====================
 app.get('/', (req, res) => {
@@ -43,7 +53,7 @@ app.get('/', (req, res) => {
 
 // Register - POST /api/auth/register
 app.post('/api/auth/register', async (req, res) => {
-    console.log('📝 Register request received:', req.body);
+    console.log('📝 Register request received:', req.body.email);
     const { name, email, password } = req.body;
     
     if (!name || !email || !password) {
@@ -142,7 +152,7 @@ app.get('/api/transactions', authenticateToken, async (req, res) => {
 
 // POST new transaction - POST /api/transactions
 app.post('/api/transactions', authenticateToken, async (req, res) => {
-    console.log('💰 Adding transaction for user:', req.user.id, req.body);
+    console.log('💰 Adding transaction for user:', req.user.id);
     const { type, amount, description, category, date } = req.body;
     
     if (!type || !amount || !description || !date) {
@@ -291,7 +301,7 @@ app.post('/api/sms/parse', authenticateToken, async (req, res) => {
     res.json({ imported: transactions.length, transactions });
 });
 
-// ==================== AI CHAT ROUTE ====================
+// ==================== AI CHAT ROUTE WITH GEMINI ====================
 
 app.post('/api/ai/chat', authenticateToken, async (req, res) => {
     console.log('🤖 AI chat request for user:', req.user.id);
@@ -301,30 +311,113 @@ app.post('/api/ai/chat', authenticateToken, async (req, res) => {
         return res.status(400).json({ error: 'Message required' });
     }
     
-    // Get recent transactions for context
-    const recentTx = await pool.query(
-        'SELECT type, amount, category FROM transactions WHERE user_id = $1 ORDER BY date DESC LIMIT 10',
-        [req.user.id]
-    );
-    
-    const totalExpenses = recentTx.rows
-        .filter(t => t.type === 'expense')
-        .reduce((sum, t) => sum + parseFloat(t.amount), 0);
-    
-    let reply = '';
-    const lowerMsg = message.toLowerCase();
-    
-    if (lowerMsg.includes('spend') || lowerMsg.includes('expense')) {
-        reply = `📊 Based on your last 10 transactions, you've spent KES ${totalExpenses.toLocaleString()}. Track categories like Food and Transport to identify savings opportunities.`;
-    } else if (lowerMsg.includes('save') || lowerMsg.includes('saving')) {
-        reply = `💡 Kenyan money-saving tips:\n1. Track M-Pesa expenses daily\n2. Use the 50/30/20 rule (Needs/Wants/Savings)\n3. Set a monthly budget in Settings\n4. Review your Insights tab for spending patterns`;
-    } else if (lowerMsg.includes('budget')) {
-        reply = `💰 Set your monthly budget in the Settings tab. I'll show you a progress bar when you approach your limit.`;
-    } else {
-        reply = `👋 Thanks for asking! I can help with:\n- Spending analysis\n- Saving tips\n- Budget tracking\n- M-Pesa/Airtel insights\n\nWhat would you like to know?`;
+    try {
+        // Get user's financial context from database
+        const transactions = await pool.query(
+            `SELECT type, amount, category, date 
+             FROM transactions 
+             WHERE user_id = $1 
+             ORDER BY date DESC 
+             LIMIT 30`,
+            [req.user.id]
+        );
+        
+        const budgetResult = await pool.query(
+            'SELECT budget FROM budgets WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1',
+            [req.user.id]
+        );
+        
+        // Calculate financial summary
+        const income = transactions.rows
+            .filter(t => t.type === 'income')
+            .reduce((sum, t) => sum + parseFloat(t.amount), 0);
+            
+        const expenses = transactions.rows
+            .filter(t => t.type === 'expense')
+            .reduce((sum, t) => sum + parseFloat(t.amount), 0);
+            
+        const budget = budgetResult.rows[0]?.budget || 0;
+        const balance = income - expenses;
+        
+        // Group expenses by category
+        const expensesByCategory = {};
+        transactions.rows.forEach(t => {
+            if (t.type === 'expense') {
+                const cat = t.category || 'Other';
+                expensesByCategory[cat] = (expensesByCategory[cat] || 0) + parseFloat(t.amount);
+            }
+        });
+        
+        const topCategories = Object.entries(expensesByCategory)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 3)
+            .map(([cat, amt]) => `${cat}: KES ${amt.toLocaleString()}`)
+            .join(', ');
+        
+        // Check if Gemini is available
+        if (genAI) {
+            // Use Gemini AI
+            const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+            
+            const prompt = `You are MoneyMind AI, a friendly financial advisor for Kenyan users who use M-Pesa and Airtel Money.
+                            
+                            USER'S REAL FINANCIAL DATA:
+                            - Total Income: KES ${income.toLocaleString()}
+                            - Total Expenses: KES ${expenses.toLocaleString()}
+                            - Net Balance: KES ${balance.toLocaleString()}
+                            - Monthly Budget: KES ${budget.toLocaleString()}
+                            - Top Spending Categories: ${topCategories || 'No expenses yet'}
+                            
+                            USER QUESTION: "${message}"
+                            
+                            RULES:
+                            1. Be concise (2-3 sentences)
+                            2. Use Kenyan context (mention M-Pesa, KES)
+                            3. If no data, guide user to add transactions
+                            4. Be encouraging and practical
+                            5. Never invent fake numbers`;
+            
+            const result = await model.generateContent(prompt);
+            const reply = result.response.text();
+            
+            console.log('✅ Gemini AI response sent');
+            res.json({ reply });
+            
+        } else {
+            // Fallback: Smart responses without AI
+            console.log('⚠️ Using fallback responses (no Gemini API key)');
+            let reply = '';
+            const lowerMsg = message.toLowerCase();
+            
+            if (transactions.rows.length === 0) {
+                reply = "📭 You don't have any transactions yet. Add some expenses or income first, then I can give you personalized advice!";
+                
+            } else if (lowerMsg.includes('spend') || lowerMsg.includes('expense')) {
+                reply = `📊 Your total expenses: KES ${expenses.toLocaleString()}. Top category: ${topCategories || 'None yet'}. ${expenses > budget && budget > 0 ? `⚠️ You're over budget by KES ${(expenses - budget).toLocaleString()}!` : 'Keep tracking!'}`;
+                
+            } else if (lowerMsg.includes('save') || lowerMsg.includes('saving')) {
+                reply = `💡 To save more: 1) Track daily M-Pesa spending 2) Reduce ${topCategories.split(',')[0] || 'unnecessary'} costs 3) Set a budget in Settings. Want specific tips?`;
+                
+            } else if (lowerMsg.includes('budget')) {
+                const percentUsed = budget > 0 ? (expenses / budget) * 100 : 0;
+                reply = `💰 Budget: KES ${budget.toLocaleString()} | Spent: KES ${expenses.toLocaleString()} (${percentUsed.toFixed(0)}%). ${percentUsed > 80 ? '⚠️ Close to limit!' : 'You\'re on track!'}`;
+                
+            } else if (lowerMsg.includes('income')) {
+                reply = `💵 Your total income: KES ${income.toLocaleString()}. Net balance: KES ${balance.toLocaleString()}. Great job!`;
+                
+            } else {
+                reply = `👋 I see you've spent KES ${expenses.toLocaleString()} total. Ask me about: "spending", "saving", "budget", or "income" for insights based on your real data!`;
+            }
+            
+            res.json({ reply });
+        }
+        
+    } catch (error) {
+        console.error('❌ AI Error:', error);
+        res.json({ 
+            reply: "🤖 AI service is temporarily unavailable. Check your Insights tab for spending patterns!" 
+        });
     }
-    
-    res.json({ reply });
 });
 
 // ==================== START SERVER ====================
