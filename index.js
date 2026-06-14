@@ -44,8 +44,9 @@ if (process.env.GEMINI_API_KEY) {
 // Mistral (1 req/sec free)
 let mistral = null;
 if (process.env.MISTRAL_API_KEY) {
-    mistral = new MistralClient(process.env.MISTRAL_API_KEY);
+    mistral = new Mistral({ apiKey: process.env.MISTRAL_API_KEY });
     console.log('✅ Mistral AI initialized');
+}
 }
 
 // Track which providers are available
