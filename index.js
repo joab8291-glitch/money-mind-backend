@@ -3,7 +3,11 @@ const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { Pool } = require('pg');
+
+// AI Provider SDKs
+const Groq = require('groq-sdk');
 const { GoogleGenerativeAI } = require("@google/generative-ai");
+const MistralClient = require('@mistralai/mistralai');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -21,20 +25,43 @@ const pool = new Pool({
 // JWT Secret
 const JWT_SECRET = process.env.JWT_SECRET || 'moneymind_super_secret_key_change_me';
 
-// Gemini AI initialization
+// ==================== INITIALIZE ALL AI PROVIDERS ====================
+
+// Groq (Fastest, 30 req/min free)
+let groq = null;
+if (process.env.GROQ_API_KEY) {
+    groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+    console.log('✅ Groq AI initialized');
+}
+
+// Gemini (1,500 req/day free)
 let genAI = null;
 if (process.env.GEMINI_API_KEY) {
     genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
     console.log('✅ Gemini AI initialized');
-} else {
-    console.log('⚠️ GEMINI_API_KEY not set. AI features will use fallback responses.');
 }
+
+// Mistral (1 req/sec free)
+let mistral = null;
+if (process.env.MISTRAL_API_KEY) {
+    mistral = new MistralClient(process.env.MISTRAL_API_KEY);
+    console.log('✅ Mistral AI initialized');
+}
+
+// Track which providers are available
+const availableProviders = [];
+if (groq) availableProviders.push('groq');
+if (genAI) availableProviders.push('gemini');
+if (mistral) availableProviders.push('mistral');
+
+console.log(`📡 Available AI providers: ${availableProviders.join(', ') || 'NONE - using fallback mode'}`);
 
 // ==================== TEST ROOT ROUTE ====================
 app.get('/', (req, res) => {
     res.json({ 
         message: 'MoneyMind Backend is running!', 
-        status: 'ok', 
+        status: 'ok',
+        ai_providers: availableProviders,
         endpoints: [
             'POST /api/auth/register',
             'POST /api/auth/login', 
@@ -301,8 +328,142 @@ app.post('/api/sms/parse', authenticateToken, async (req, res) => {
     res.json({ imported: transactions.length, transactions });
 });
 
-// ==================== AI CHAT ROUTE WITH GEMINI ====================
+// ==================== AI CHAT ROUTE WITH MULTI-PROVIDER FAILOVER ====================
 
+// Helper function to get financial context
+async function getFinancialContext(userId) {
+    const transactions = await pool.query(
+        `SELECT type, amount, category, date 
+         FROM transactions 
+         WHERE user_id = $1 
+         ORDER BY date DESC 
+         LIMIT 30`,
+        [userId]
+    );
+    
+    const budgetResult = await pool.query(
+        'SELECT budget FROM budgets WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1',
+        [userId]
+    );
+    
+    const income = transactions.rows
+        .filter(t => t.type === 'income')
+        .reduce((sum, t) => sum + parseFloat(t.amount), 0);
+        
+    const expenses = transactions.rows
+        .filter(t => t.type === 'expense')
+        .reduce((sum, t) => sum + parseFloat(t.amount), 0);
+        
+    const budget = budgetResult.rows[0]?.budget || 0;
+    const balance = income - expenses;
+    
+    const expensesByCategory = {};
+    transactions.rows.forEach(t => {
+        if (t.type === 'expense') {
+            const cat = t.category || 'Other';
+            expensesByCategory[cat] = (expensesByCategory[cat] || 0) + parseFloat(t.amount);
+        }
+    });
+    
+    const topCategories = Object.entries(expensesByCategory)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 3)
+        .map(([cat, amt]) => `${cat}: KES ${amt.toLocaleString()}`)
+        .join(', ');
+    
+    return { income, expenses, budget, balance, topCategories, transactionCount: transactions.rows.length };
+}
+
+// Helper function to build system prompt
+function buildSystemPrompt(context) {
+    return `You are MoneyMind AI, a friendly financial advisor for Kenyan users who use M-Pesa and Airtel Money.
+
+USER'S REAL FINANCIAL DATA:
+- Total Income: KES ${context.income.toLocaleString()}
+- Total Expenses: KES ${context.expenses.toLocaleString()}
+- Net Balance: KES ${context.balance.toLocaleString()}
+- Monthly Budget: KES ${context.budget.toLocaleString()}
+- Top Spending Categories: ${context.topCategories || 'No expenses yet'}
+
+RULES:
+1. Be concise (2-3 sentences)
+2. Use Kenyan context (mention M-Pesa, KES)
+3. If no data, guide user to add transactions
+4. Be encouraging and practical
+5. Never invent fake numbers`;
+}
+
+// Try each provider in order until one works
+async function callAIWithFailover(systemPrompt, userMessage) {
+    const errors = [];
+    
+    // Try Groq first (fastest, highest limit)
+    if (groq) {
+        try {
+            console.log('🔄 Trying Groq...');
+            const completion = await groq.chat.completions.create({
+                messages: [
+                    { role: "system", content: systemPrompt },
+                    { role: "user", content: userMessage }
+                ],
+                model: "llama3-70b-8192",
+                temperature: 0.7,
+                max_tokens: 300,
+            });
+            const reply = completion.choices[0]?.message?.content;
+            if (reply) {
+                console.log('✅ Groq succeeded');
+                return { reply, provider: 'groq' };
+            }
+        } catch (err) {
+            console.log(`⚠️ Groq failed: ${err.message}`);
+            errors.push(`Groq: ${err.message}`);
+        }
+    }
+    
+    // Try Gemini second
+    if (genAI) {
+        try {
+            console.log('🔄 Trying Gemini...');
+            const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+            const result = await model.generateContent(`${systemPrompt}\n\nUser: ${userMessage}`);
+            const reply = result.response.text();
+            if (reply) {
+                console.log('✅ Gemini succeeded');
+                return { reply, provider: 'gemini' };
+            }
+        } catch (err) {
+            console.log(`⚠️ Gemini failed: ${err.message}`);
+            errors.push(`Gemini: ${err.message}`);
+        }
+    }
+    
+    // Try Mistral third
+    if (mistral) {
+        try {
+            console.log('🔄 Trying Mistral...');
+            const response = await mistral.chat({
+                model: "mistral-tiny",
+                messages: [
+                    { role: "system", content: systemPrompt },
+                    { role: "user", content: userMessage }
+                ]
+            });
+            const reply = response.choices[0]?.message?.content;
+            if (reply) {
+                console.log('✅ Mistral succeeded');
+                return { reply, provider: 'mistral' };
+            }
+        } catch (err) {
+            console.log(`⚠️ Mistral failed: ${err.message}`);
+            errors.push(`Mistral: ${err.message}`);
+        }
+    }
+    
+    return { reply: null, errors };
+}
+
+// Main AI endpoint
 app.post('/api/ai/chat', authenticateToken, async (req, res) => {
     console.log('🤖 AI chat request for user:', req.user.id);
     const { message } = req.body;
@@ -312,105 +473,46 @@ app.post('/api/ai/chat', authenticateToken, async (req, res) => {
     }
     
     try {
-        // Get user's financial context from database
-        const transactions = await pool.query(
-            `SELECT type, amount, category, date 
-             FROM transactions 
-             WHERE user_id = $1 
-             ORDER BY date DESC 
-             LIMIT 30`,
-            [req.user.id]
-        );
+        // Get user's financial context
+        const context = await getFinancialContext(req.user.id);
         
-        const budgetResult = await pool.query(
-            'SELECT budget FROM budgets WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1',
-            [req.user.id]
-        );
-        
-        // Calculate financial summary
-        const income = transactions.rows
-            .filter(t => t.type === 'income')
-            .reduce((sum, t) => sum + parseFloat(t.amount), 0);
-            
-        const expenses = transactions.rows
-            .filter(t => t.type === 'expense')
-            .reduce((sum, t) => sum + parseFloat(t.amount), 0);
-            
-        const budget = budgetResult.rows[0]?.budget || 0;
-        const balance = income - expenses;
-        
-        // Group expenses by category
-        const expensesByCategory = {};
-        transactions.rows.forEach(t => {
-            if (t.type === 'expense') {
-                const cat = t.category || 'Other';
-                expensesByCategory[cat] = (expensesByCategory[cat] || 0) + parseFloat(t.amount);
-            }
-        });
-        
-        const topCategories = Object.entries(expensesByCategory)
-            .sort((a, b) => b[1] - a[1])
-            .slice(0, 3)
-            .map(([cat, amt]) => `${cat}: KES ${amt.toLocaleString()}`)
-            .join(', ');
-        
-        // Check if Gemini is available
-        if (genAI) {
-            // Use Gemini AI
-            const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
-            
-            const prompt = `You are MoneyMind AI, a friendly financial advisor for Kenyan users who use M-Pesa and Airtel Money.
-                            
-                            USER'S REAL FINANCIAL DATA:
-                            - Total Income: KES ${income.toLocaleString()}
-                            - Total Expenses: KES ${expenses.toLocaleString()}
-                            - Net Balance: KES ${balance.toLocaleString()}
-                            - Monthly Budget: KES ${budget.toLocaleString()}
-                            - Top Spending Categories: ${topCategories || 'No expenses yet'}
-                            
-                            USER QUESTION: "${message}"
-                            
-                            RULES:
-                            1. Be concise (2-3 sentences)
-                            2. Use Kenyan context (mention M-Pesa, KES)
-                            3. If no data, guide user to add transactions
-                            4. Be encouraging and practical
-                            5. Never invent fake numbers`;
-            
-            const result = await model.generateContent(prompt);
-            const reply = result.response.text();
-            
-            console.log('✅ Gemini AI response sent');
-            res.json({ reply });
-            
-        } else {
-            // Fallback: Smart responses without AI
-            console.log('⚠️ Using fallback responses (no Gemini API key)');
-            let reply = '';
-            const lowerMsg = message.toLowerCase();
-            
-            if (transactions.rows.length === 0) {
-                reply = "📭 You don't have any transactions yet. Add some expenses or income first, then I can give you personalized advice!";
-                
-            } else if (lowerMsg.includes('spend') || lowerMsg.includes('expense')) {
-                reply = `📊 Your total expenses: KES ${expenses.toLocaleString()}. Top category: ${topCategories || 'None yet'}. ${expenses > budget && budget > 0 ? `⚠️ You're over budget by KES ${(expenses - budget).toLocaleString()}!` : 'Keep tracking!'}`;
-                
-            } else if (lowerMsg.includes('save') || lowerMsg.includes('saving')) {
-                reply = `💡 To save more: 1) Track daily M-Pesa spending 2) Reduce ${topCategories.split(',')[0] || 'unnecessary'} costs 3) Set a budget in Settings. Want specific tips?`;
-                
-            } else if (lowerMsg.includes('budget')) {
-                const percentUsed = budget > 0 ? (expenses / budget) * 100 : 0;
-                reply = `💰 Budget: KES ${budget.toLocaleString()} | Spent: KES ${expenses.toLocaleString()} (${percentUsed.toFixed(0)}%). ${percentUsed > 80 ? '⚠️ Close to limit!' : 'You\'re on track!'}`;
-                
-            } else if (lowerMsg.includes('income')) {
-                reply = `💵 Your total income: KES ${income.toLocaleString()}. Net balance: KES ${balance.toLocaleString()}. Great job!`;
-                
-            } else {
-                reply = `👋 I see you've spent KES ${expenses.toLocaleString()} total. Ask me about: "spending", "saving", "budget", or "income" for insights based on your real data!`;
-            }
-            
-            res.json({ reply });
+        // Check if user has any transactions
+        if (context.transactionCount === 0) {
+            return res.json({ 
+                reply: "📭 You don't have any transactions yet. Add some expenses or income first, then I can give you personalized financial advice!"
+            });
         }
+        
+        // Build the system prompt
+        const systemPrompt = buildSystemPrompt(context);
+        
+        // Try all available AI providers
+        const result = await callAIWithFailover(systemPrompt, message);
+        
+        if (result.reply) {
+            console.log(`✅ AI response sent via ${result.provider}`);
+            return res.json({ reply: result.reply });
+        }
+        
+        // If all AI providers failed, use smart fallback responses
+        console.log('⚠️ All AI providers failed, using fallback');
+        const lowerMsg = message.toLowerCase();
+        let fallbackReply = '';
+        
+        if (lowerMsg.includes('spend') || lowerMsg.includes('expense')) {
+            fallbackReply = `📊 Your total expenses: KES ${context.expenses.toLocaleString()}. Top category: ${context.topCategories || 'None yet'}. ${context.expenses > context.budget && context.budget > 0 ? `⚠️ You're over budget by KES ${(context.expenses - context.budget).toLocaleString()}!` : 'Keep tracking!'}`;
+        } else if (lowerMsg.includes('save') || lowerMsg.includes('saving')) {
+            fallbackReply = `💡 To save more: 1) Track daily M-Pesa spending 2) Reduce ${context.topCategories.split(',')[0] || 'unnecessary'} costs 3) Set a budget in Settings.`;
+        } else if (lowerMsg.includes('budget')) {
+            const percentUsed = context.budget > 0 ? (context.expenses / context.budget) * 100 : 0;
+            fallbackReply = `💰 Budget: KES ${context.budget.toLocaleString()} | Spent: KES ${context.expenses.toLocaleString()} (${percentUsed.toFixed(0)}%). ${percentUsed > 80 ? '⚠️ Close to limit!' : 'You\'re on track!'}`;
+        } else if (lowerMsg.includes('income')) {
+            fallbackReply = `💵 Your total income: KES ${context.income.toLocaleString()}. Net balance: KES ${context.balance.toLocaleString()}. Great job!`;
+        } else {
+            fallbackReply = `👋 I see you've spent KES ${context.expenses.toLocaleString()} total. Ask me about: "spending", "saving", "budget", or "income" for insights based on your real data!`;
+        }
+        
+        res.json({ reply: fallbackReply });
         
     } catch (error) {
         console.error('❌ AI Error:', error);
@@ -425,4 +527,5 @@ app.post('/api/ai/chat', authenticateToken, async (req, res) => {
 app.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);
     console.log(`📡 API available at: https://money-mind-backend-tzih.onrender.com`);
+    console.log(`🤖 Available AI providers: ${availableProviders.join(', ') || 'NONE - fallback mode active'}`);
 });
