@@ -1,10 +1,12 @@
 {
-  "name": "money-mind-backend",
+  "name": "moneymind-backend",
   "version": "1.0.0",
-  "description": "Backend for MoneyMind - Kenya's smart budget tracker",
+  "description": "Backend for MoneyMind Kenya",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "init-db": "node init-db.js"
   },
   "dependencies": {
     "express": "^4.18.2",
