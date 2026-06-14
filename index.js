@@ -21,7 +21,7 @@ const pool = new Pool({
 // JWT Secret
 const JWT_SECRET = process.env.JWT_SECRET || 'moneymind_super_secret_key_change_me';
 
-// Gemini AI initialization (will be null if no API key)
+// Gemini AI initialization
 let genAI = null;
 if (process.env.GEMINI_API_KEY) {
     genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
