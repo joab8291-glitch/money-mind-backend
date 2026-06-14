@@ -7,7 +7,7 @@ const { Pool } = require('pg');
 // AI Provider SDKs
 const Groq = require('groq-sdk');
 const { GoogleGenerativeAI } = require("@google/generative-ai");
-const MistralClient = require('@mistralai/mistralai');
+const { Mistral } = require('@mistralai/mistralai');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
