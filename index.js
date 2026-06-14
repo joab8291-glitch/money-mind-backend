@@ -47,7 +47,6 @@ if (process.env.MISTRAL_API_KEY) {
     mistral = new Mistral({ apiKey: process.env.MISTRAL_API_KEY });
     console.log('✅ Mistral AI initialized');
 }
-}
 
 // Track which providers are available
 const availableProviders = [];
@@ -276,13 +275,10 @@ app.post('/api/sms/parse', authenticateToken, async (req, res) => {
         let amount = null;
         let description = null;
         
-        // M-Pesa patterns
         const mpesaReceived = line.match(/Received Ksh([\d,]+) from ([^\n]+)/i);
         const mpesaSent = line.match(/Sent Ksh([\d,]+) to ([^\n]+)/i);
         const mpesaReceived2 = line.match(/Ksh([\d,]+) received from ([^\n]+)/i);
         const mpesaSent2 = line.match(/Ksh([\d,]+) sent to ([^\n]+)/i);
-        
-        // Airtel patterns
         const airtelReceived = line.match(/received KES ([\d,]+) from ([^\n]+)/i);
         const airtelSent = line.match(/sent KES ([\d,]+) to ([^\n]+)/i);
         
@@ -317,7 +313,6 @@ app.post('/api/sms/parse', authenticateToken, async (req, res) => {
         }
     }
     
-    // Save to database
     for (const tx of transactions) {
         await pool.query(
             'INSERT INTO transactions (user_id, type, amount, description, category, date) VALUES ($1, $2, $3, $4, $5, $6)',
@@ -329,9 +324,8 @@ app.post('/api/sms/parse', authenticateToken, async (req, res) => {
     res.json({ imported: transactions.length, transactions });
 });
 
-// ==================== AI CHAT ROUTE WITH MULTI-PROVIDER FAILOVER ====================
+// ==================== HELPER FUNCTIONS FOR AI ====================
 
-// Helper function to get financial context
 async function getFinancialContext(userId) {
     const transactions = await pool.query(
         `SELECT type, amount, category, date 
@@ -375,7 +369,6 @@ async function getFinancialContext(userId) {
     return { income, expenses, budget, balance, topCategories, transactionCount: transactions.rows.length };
 }
 
-// Helper function to build system prompt
 function buildSystemPrompt(context) {
     return `You are MoneyMind AI, a friendly financial advisor for Kenyan users who use M-Pesa and Airtel Money.
 
@@ -394,11 +387,9 @@ RULES:
 5. Never invent fake numbers`;
 }
 
-// Try each provider in order until one works
 async function callAIWithFailover(systemPrompt, userMessage) {
     const errors = [];
     
-    // Try Groq first (fastest, highest limit)
     if (groq) {
         try {
             console.log('🔄 Trying Groq...');
@@ -422,7 +413,6 @@ async function callAIWithFailover(systemPrompt, userMessage) {
         }
     }
     
-    // Try Gemini second
     if (genAI) {
         try {
             console.log('🔄 Trying Gemini...');
@@ -439,32 +429,32 @@ async function callAIWithFailover(systemPrompt, userMessage) {
         }
     }
     
-// Try Mistral third
-if (mistral) {
-    try {
-        console.log('🔄 Trying Mistral...');
-        const response = await mistral.chat.complete({
-            model: "mistral-tiny",
-            messages: [
-                { role: "system", content: systemPrompt },
-                { role: "user", content: userMessage }
-            ]
-        });
-        const reply = response.choices[0]?.message?.content;
-        if (reply) {
-            console.log('✅ Mistral succeeded');
-            return { reply, provider: 'mistral' };
+    if (mistral) {
+        try {
+            console.log('🔄 Trying Mistral...');
+            const response = await mistral.chat.complete({
+                model: "mistral-tiny",
+                messages: [
+                    { role: "system", content: systemPrompt },
+                    { role: "user", content: userMessage }
+                ]
+            });
+            const reply = response.choices[0]?.message?.content;
+            if (reply) {
+                console.log('✅ Mistral succeeded');
+                return { reply, provider: 'mistral' };
+            }
+        } catch (err) {
+            console.log(`⚠️ Mistral failed: ${err.message}`);
+            errors.push(`Mistral: ${err.message}`);
         }
-    } catch (err) {
-        console.log(`⚠️ Mistral failed: ${err.message}`);
-        errors.push(`Mistral: ${err.message}`);
     }
-}
     
     return { reply: null, errors };
 }
 
-// Main AI endpoint
+// ==================== AI CHAT ROUTE ====================
+
 app.post('/api/ai/chat', authenticateToken, async (req, res) => {
     console.log('🤖 AI chat request for user:', req.user.id);
     const { message } = req.body;
@@ -474,20 +464,15 @@ app.post('/api/ai/chat', authenticateToken, async (req, res) => {
     }
     
     try {
-        // Get user's financial context
         const context = await getFinancialContext(req.user.id);
         
-        // Check if user has any transactions
         if (context.transactionCount === 0) {
             return res.json({ 
                 reply: "📭 You don't have any transactions yet. Add some expenses or income first, then I can give you personalized financial advice!"
             });
         }
         
-        // Build the system prompt
         const systemPrompt = buildSystemPrompt(context);
-        
-        // Try all available AI providers
         const result = await callAIWithFailover(systemPrompt, message);
         
         if (result.reply) {
@@ -495,8 +480,6 @@ app.post('/api/ai/chat', authenticateToken, async (req, res) => {
             return res.json({ reply: result.reply });
         }
         
-        // If all AI providers failed, use smart fallback responses
-        console.log('⚠️ All AI providers failed, using fallback');
         const lowerMsg = message.toLowerCase();
         let fallbackReply = '';
         
