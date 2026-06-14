@@ -27,12 +27,11 @@ app.get('/', (req, res) => {
   });
 });
 
-// Routes
-app.use('/api/auth', require('./routes/auth'));
-app.use('/api/transactions', require('./routes/transactions'));
-app.use('/api/sms', require('./routes/sms'));
-app.use('/api/budget', require('./routes/budget'));
-
+// Routes - Files are in root (not in routes/ folder)
+app.use('/api/auth', require('./auth'));
+app.use('/api/transactions', require('./transactions'));
+app.use('/api/sms', require('./sms'));
+app.use('/api/budget', require('./budget'));
 // Error handler
 app.use((err, req, res, next) => {
   console.error(err);
